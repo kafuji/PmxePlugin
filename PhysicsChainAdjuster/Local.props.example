@@ -1,0 +1,10 @@
+<Project>
+  <PropertyGroup>
+    <!-- Local install path for PMX Editor plugin output -->
+    <OutputPath>[Path to PMX Editor]\_plugin\User\</OutputPath>
+
+    <!-- Local SDK / dependency paths -->
+    <PEPluginPath>[Path to PMX Editor]\Lib\PEPlugin\PEPlugin.dll</PEPluginPath>
+    <SlimDXPath>[Path to PMX Editor]\Lib\SlimDX\x64\SlimDX.dll</SlimDXPath>
+  </PropertyGroup>
+</Project>
