@@ -25,6 +25,9 @@ packages/
 # Logs and diagnostics
 *.log
 
+# Local machine-specific build settings
+PhysicsChainAdjuster/PhysicsChainAdjuster.Local.props
+
 # OS-generated files
 .DS_Store
 Thumbs.db
