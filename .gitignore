@@ -1,0 +1,30 @@
+# Visual Studio / .NET build outputs
+[Bb]in/
+[Oo]bj/
+x64/
+
+# IDE and user-specific files
+.vs/
+.vscode/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Test and coverage results
+[Tt]est[Rr]esult*/
+[Bb]enchmark[Dd]ot[Nn]et.Artifacts/
+*.coverage
+*.coveragexml
+
+# NuGet
+packages/
+*.nupkg
+*.snupkg
+
+# Logs and diagnostics
+*.log
+
+# OS-generated files
+.DS_Store
+Thumbs.db
