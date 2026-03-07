@@ -10,7 +10,7 @@ namespace PhysicsChainAdjuster
 		private const string PluginName = "[Kafuji式] 物理チェーン自動調整";
 		public string Name => PluginName;
 		public string Version => "1.1.0";
-		public string Description => "分岐を含むボーン木の剛体質量・ジョイントスプリングを補完設定します";
+		public string Description => "分岐を含むダイナミック剛体列（復数可）の質量・ジョイントスプリングを一括で補完設定します";
 
 		// これがないとLimitedPluginLauncherがこのプラグインの名前を取得できない
 		public IPEPluginOption Option { get; } =
@@ -21,21 +21,37 @@ namespace PhysicsChainAdjuster
 			try
 			{
 				var pmx = args.Host.Connector.Pmx.GetCurrentState();
-				int[] selected = ResolveSelectedBoneIndices(args, pmx);
+				var selectedBodies = ResolveSelectedBodies(args, pmx);
+
+				if (selectedBodies.Count == 0)
+				{
+					return;
+				}
+
+				if (selectedBodies.Any(body => body.Mode == BodyMode.Static))
+				{
+					MessageBox.Show("選択剛体にキネマティック剛体（ボーン追従剛体）が含まれています。対象から外してください。", "エラー",
+						MessageBoxButtons.OK, MessageBoxIcon.Warning);
+					return;
+				}
+
+				int[] selected = ResolveSelectedBoneIndicesFromBodies(pmx, selectedBodies);
 
 				if (selected.Length == 0)
 				{
+					MessageBox.Show("選択剛体に対応するボーンを取得できませんでした。", "エラー",
+						MessageBoxButtons.OK, MessageBoxIcon.Warning);
 					return;
 				}
 
 				if (selected.Length == 1)
 				{
-					MessageBox.Show("2つ以上の関連剛体を持つボーンか、ジョイントで接続された剛体群を選択してください。", "エラー",
+					MessageBox.Show("ジョイントで接続された関連剛体を2つ以上選択してください。", "エラー",
 						MessageBoxButtons.OK, MessageBoxIcon.Warning);
 					return;
 				}
 
-				if (!ValidateSelection(pmx, selected, out var validationError))
+				if (!ValidateSelection(pmx, selected, selectedBodies, out var validationError))
 				{
 					MessageBox.Show(
 						validationError,
@@ -72,22 +88,25 @@ namespace PhysicsChainAdjuster
 			}
 		}
 
-		private int[] ResolveSelectedBoneIndices(IPERunArgs args, IPXPmx pmx)
+		private List<IPXBody> ResolveSelectedBodies(IPERunArgs args, IPXPmx pmx)
 		{
-			int[] selectedBoneIndices = args.Host.Connector.View.PMDView.GetSelectedBoneIndices()
-				?? Array.Empty<int>();
-			if (selectedBoneIndices.Length > 0)
-				return selectedBoneIndices;
-
 			int[] selectedBodyIndices = args.Host.Connector.View.PMDView.GetSelectedBodyIndices()
 				?? Array.Empty<int>();
 			if (selectedBodyIndices.Length == 0)
-				return Array.Empty<int>();
+				return new List<IPXBody>();
 
-			var selectedBodyIndexSet = new HashSet<int>(selectedBodyIndices);
-			return Enumerable.Range(0, pmx.Body.Count)
-				.Where(i => selectedBodyIndexSet.Contains(i) && pmx.Body[i].Bone != null)
-				.Select(i => pmx.Bone.IndexOf(pmx.Body[i].Bone))
+			return selectedBodyIndices
+				.Where(i => i >= 0 && i < pmx.Body.Count)
+				.Select(i => pmx.Body[i])
+				.Distinct()
+				.ToList();
+		}
+
+		private int[] ResolveSelectedBoneIndicesFromBodies(IPXPmx pmx, IEnumerable<IPXBody> selectedBodies)
+		{
+			return selectedBodies
+				.Where(body => body.Bone != null)
+				.Select(body => pmx.Bone.IndexOf(body.Bone))
 				.Where(i => i >= 0)
 				.Distinct()
 				.ToArray();
@@ -148,7 +167,7 @@ namespace PhysicsChainAdjuster
 			return components;
 		}
 
-		private bool ValidateSelection(IPXPmx pmx, int[] selectedIndices, out string error)
+		private bool ValidateSelection(IPXPmx pmx, int[] selectedIndices, IEnumerable<IPXBody> selectedBodies, out string error)
 		{
 			error = string.Empty;
 			var selectedSet = new HashSet<IPXBone>(selectedIndices.Select(i => pmx.Bone[i]));
@@ -158,19 +177,8 @@ namespace PhysicsChainAdjuster
 				return false;
 			}
 
-			var rigidMap = BuildRigidBodyMap(pmx);
-			var selectedBodies = selectedSet
-				.Where(rigidMap.ContainsKey)
-				.SelectMany(b => rigidMap[b])
-				.ToHashSet();
-
-			if (selectedBodies.Any(body => body.Mode == BodyMode.DynamicWithBone))
-			{
-				error = "キネマティック剛体（ボーン追従剛体）が含まれています。対象から外してください。";
-				return false;
-			}
-
-			if (HasJointCycle(pmx, selectedBodies))
+			var selectedBodySet = selectedBodies.ToHashSet();
+			if (HasJointCycle(pmx, selectedBodySet))
 			{
 				error = "ジョイントの接続に循環が含まれています。循環しない木構造になるよう選択し直してください。";
 				return false;
@@ -186,7 +194,7 @@ namespace PhysicsChainAdjuster
 			bool hasRoot = selectedSet.Any(b => b.Parent == null || !selectedSet.Contains(b.Parent));
 			if (!hasRoot)
 			{
-				error = "選択ボーン列の先頭を判定できませんでした。";
+				error = "選択剛体に対応するボーン列の先頭を判定できませんでした。";
 				return false;
 			}
 
@@ -204,7 +212,7 @@ namespace PhysicsChainAdjuster
 				{
 					if (!path.Add(cur))
 					{
-						error = "選択ボーン内に循環参照が含まれています。";
+						error = "選択剛体に対応するボーン内に循環参照が含まれています。";
 						return false;
 					}
 
@@ -334,7 +342,10 @@ namespace PhysicsChainAdjuster
 			{
 				double t = maxDepth == 0 ? 0.0 : (double)pair.Value / maxDepth;
 				float spring = (float)Interpolate(s.SpringStart, s.SpringEnd, t, s.UseLogInterp);
-				pair.Key.SpringConst_Rotate = new V3(spring, spring, spring);
+				pair.Key.SpringConst_Rotate = new V3(
+					spring * s.SpringAxisScaleX,
+					spring * s.SpringAxisScaleY,
+					spring * s.SpringAxisScaleZ);
 			}
 		}
 
@@ -452,92 +463,109 @@ namespace PhysicsChainAdjuster
 		public int MaxDepth { get; }
 	}
 
-	public class PhysicsSettings
-	{
-		public float MassStart { get; set; } = 1.0f;
-		public float MassEnd { get; set; } = 0.1f;
-		public float SpringStart { get; set; } = 100f;
-		public float SpringEnd { get; set; } = 10f;
-		public bool UseLogInterp { get; set; } = true;
-	}
+		public class PhysicsSettings
+		{
+			public float MassStart { get; set; } = 1.0f;
+			public float MassEnd { get; set; } = 0.1f;
+			public float SpringStart { get; set; } = 100f;
+			public float SpringEnd { get; set; } = 10f;
+			public float SpringAxisScaleX { get; set; } = 1.0f;
+			public float SpringAxisScaleY { get; set; } = 1.0f;
+			public float SpringAxisScaleZ { get; set; } = 1.0f;
+			public bool UseLogInterp { get; set; } = true;
+		}
 
 	public class SettingDialog : Form
 	{
 		public PhysicsSettings Settings { get; private set; } = new PhysicsSettings();
 
-		private NumericUpDown _massStart, _massEnd, _springStart, _springEnd;
+		private TextBox _massStart = null!, _massEnd = null!, _springStart = null!, _springEnd = null!;
+		private TextBox _springAxisScaleX = null!, _springAxisScaleY = null!, _springAxisScaleZ = null!;
 		private RadioButton _rbLinear, _rbLog;
-		private Label _chainInfoLabel;
+		private Label _selectionInfoLabel;
+		private Label _depthInfoLabel;
 
 		public SettingDialog(List<BoneComponent> components)
 		{
 			Text = "物理チェーン自動調整";
 			FormBorderStyle = FormBorderStyle.FixedDialog;
 			StartPosition = FormStartPosition.CenterParent;
-			Width = 360;
-			Height = 340;
+			Width = 320;
+			Height = 388;
 			MaximizeBox = false;
 			MinimizeBox = false;
 
 			int y = 12;
 
-			_chainInfoLabel = new Label
+			_selectionInfoLabel = new Label
 			{
-				Text = $"検出グループ数: {components.Count}件  " +
-						 $"(各最大段数: {string.Join(", ", components.Select(c => c.MaxDepth + 1))})",
+				Text = $"選択剛体グループ数: {components.Count}件",
 				Left = 12,
 				Top = y,
-				Width = 330,
-				Height = 20
+				Width = 292,
+				Height = 18
 			};
-			Controls.Add(_chainInfoLabel);
-			y += 28;
+			Controls.Add(_selectionInfoLabel);
+			y += 20;
 
-			AddSectionLabel("剛体", y); y += 22;
-			_massStart = AddRow("始点質量", 1.0f, ref y);
-			_massEnd = AddRow("終端質量", 0.1f, ref y);
+			_depthInfoLabel = new Label
+			{
+				Text = $"各最大段数: {string.Join(", ", components.Select(c => c.MaxDepth + 1))}",
+				Left = 12,
+				Top = y,
+				Width = 292,
+				Height = 28
+			};
+			Controls.Add(_depthInfoLabel);
+			y += 34;
+
+			AddSectionLabel("剛体質量", y); y += 20;
+			_massStart = AddRow("始点", "1.0", ref y);
+			_massEnd = AddRow("終点", "0.1", ref y);
+			y += 2;
+
+			AddSectionLabel("スプリング（回転）", y); y += 20;
+			_springStart = AddRow("始点", "100", ref y);
+			_springEnd = AddRow("終点", "10", ref y);
+			y += 2;
+			AddAxisScaleRow(ref y);
 			y += 4;
 
-			AddSectionLabel("スプリング（回転）", y); y += 22;
-			_springStart = AddRow("始点", 100f, ref y);
-			_springEnd = AddRow("終点", 10f, ref y);
-			y += 4;
-
-			AddSectionLabel("補完方式", y); y += 22;
-			_rbLinear = new RadioButton { Text = "線形", Left = 20, Top = y, Width = 110 };
-			_rbLog = new RadioButton { Text = "対数", Left = 140, Top = y, Width = 110, Checked = true };
+			AddSectionLabel("補完方式", y); y += 20;
+			_rbLog = new RadioButton { Text = "対数", Left = 20, Top = y, Width = 56, Checked = true };
+			_rbLinear = new RadioButton { Text = "線形", Left = 88, Top = y, Width = 56 };
 			Controls.Add(_rbLinear);
 			Controls.Add(_rbLog);
-			y += 30;
+			y += 26;
 
 			var btnOk = new Button
 			{
 				Text = "適用",
 				DialogResult = DialogResult.OK,
-				Left = 180,
+				Left = 150,
 				Top = y,
-				Width = 72,
-				Height = 28
+				Width = 60,
+				Height = 24
 			};
 			var btnCancel = new Button
 			{
 				Text = "キャンセル",
 				DialogResult = DialogResult.Cancel,
-				Left = 260,
+				Left = 218,
 				Top = y,
-				Width = 80,
-				Height = 28
+				Width = 72,
+				Height = 24
 			};
 			btnOk.Click += (_, __) =>
 			{
-				Settings = new PhysicsSettings
+				if (!TryReadSettings(out var settings, out var errorMessage))
 				{
-					MassStart = (float)_massStart.Value,
-					MassEnd = (float)_massEnd.Value,
-					SpringStart = (float)_springStart.Value,
-					SpringEnd = (float)_springEnd.Value,
-					UseLogInterp = _rbLog.Checked
-				};
+					MessageBox.Show(errorMessage, "入力エラー", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+					DialogResult = DialogResult.None;
+					return;
+				}
+
+				Settings = settings;
 			};
 			Controls.Add(btnOk);
 			Controls.Add(btnCancel);
@@ -558,24 +586,106 @@ namespace PhysicsChainAdjuster
 			});
 		}
 
-		private NumericUpDown AddRow(string label, float defaultVal, ref int y)
+		private TextBox AddRow(string label, string defaultVal, ref int y)
 		{
-			Controls.Add(new Label { Text = label, Left = 20, Top = y + 2, Width = 150, Height = 18 });
-			var nud = new NumericUpDown
+			Controls.Add(new Label { Text = label, Left = 20, Top = y + 3, Width = 64, Height = 18 });
+			var textBox = new TextBox
 			{
-				Left = 175,
+				Left = 108,
 				Top = y,
-				Width = 100,
-				Height = 24,
-				Minimum = 0,
-				Maximum = 10000,
-				DecimalPlaces = 2,
-				Increment = 0.1m,
-				Value = (decimal)defaultVal
+				Width = 60,
+				Height = 23,
+				Text = defaultVal
 			};
-			Controls.Add(nud);
-			y += 28;
-			return nud;
+			Controls.Add(textBox);
+			y += 24;
+			return textBox;
+		}
+
+		private void AddAxisScaleRow(ref int y)
+		{
+			Controls.Add(new Label { Text = "軸ごとの係数", Left = 20, Top = y + 3, Width = 78, Height = 18 });
+			Controls.Add(new Label { Text = "X軸", Left = 108, Top = y + 3, Width = 24, Height = 18 });
+			_springAxisScaleX = new TextBox { Left = 132, Top = y, Width = 34, Height = 23, Text = "1.0" };
+			Controls.Add(_springAxisScaleX);
+			Controls.Add(new Label { Text = "Y軸", Left = 172, Top = y + 3, Width = 24, Height = 18 });
+			_springAxisScaleY = new TextBox { Left = 196, Top = y, Width = 34, Height = 23, Text = "1.0" };
+			Controls.Add(_springAxisScaleY);
+			Controls.Add(new Label { Text = "Z軸", Left = 236, Top = y + 3, Width = 24, Height = 18 });
+			_springAxisScaleZ = new TextBox { Left = 260, Top = y, Width = 34, Height = 23, Text = "1.0" };
+			Controls.Add(_springAxisScaleZ);
+			y += 24;
+		}
+
+		private bool TryReadSettings(out PhysicsSettings settings, out string errorMessage)
+		{
+			settings = new PhysicsSettings();
+			errorMessage = string.Empty;
+
+			if (!TryParseNonNegativeFloat(_massStart.Text, out float massStart))
+			{
+				errorMessage = "剛体質量の始点に 0 以上の数値を入力してください。";
+				return false;
+			}
+
+			if (!TryParseNonNegativeFloat(_massEnd.Text, out float massEnd))
+			{
+				errorMessage = "剛体質量の終点に 0 以上の数値を入力してください。";
+				return false;
+			}
+
+			if (!TryParseNonNegativeFloat(_springStart.Text, out float springStart))
+			{
+				errorMessage = "スプリングの始点に 0 以上の数値を入力してください。";
+				return false;
+			}
+
+			if (!TryParseNonNegativeFloat(_springEnd.Text, out float springEnd))
+			{
+				errorMessage = "スプリングの終点に 0 以上の数値を入力してください。";
+				return false;
+			}
+
+			if (!TryParseNonNegativeFloat(_springAxisScaleX.Text, out float springAxisScaleX))
+			{
+				errorMessage = "X軸係数に 0 以上の数値を入力してください。";
+				return false;
+			}
+
+			if (!TryParseNonNegativeFloat(_springAxisScaleY.Text, out float springAxisScaleY))
+			{
+				errorMessage = "Y軸係数に 0 以上の数値を入力してください。";
+				return false;
+			}
+
+			if (!TryParseNonNegativeFloat(_springAxisScaleZ.Text, out float springAxisScaleZ))
+			{
+				errorMessage = "Z軸係数に 0 以上の数値を入力してください。";
+				return false;
+			}
+
+			settings = new PhysicsSettings
+			{
+				MassStart = massStart,
+				MassEnd = massEnd,
+				SpringStart = springStart,
+				SpringEnd = springEnd,
+				SpringAxisScaleX = springAxisScaleX,
+				SpringAxisScaleY = springAxisScaleY,
+				SpringAxisScaleZ = springAxisScaleZ,
+				UseLogInterp = _rbLog.Checked
+			};
+			return true;
+		}
+
+		private bool TryParseNonNegativeFloat(string text, out float value)
+		{
+			if (!float.TryParse(text, out value))
+			{
+				return false;
+			}
+
+			return value >= 0f;
 		}
 	}
 }
