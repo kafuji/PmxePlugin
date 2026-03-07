@@ -2,21 +2,19 @@
 using PEPlugin.Pmd;
 using PEPlugin.Pmx;
 using PEPlugin.SDX;
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Windows.Forms;
 
 namespace PhysicsChainAdjuster
 {
 	public class Plugin : IPEPlugin
 	{
-		public string Name => "物理チェーン自動調整";
-		public string Version => "1.0.0";
-		public string Description => "ボーンチェーンの剛体質量・ジョイントスプリングを補完設定します";
+		private const string PluginName = "[Kafuji式] 物理チェーン自動調整";
+		public string Name => PluginName;
+		public string Version => "1.1.0";
+		public string Description => "分岐を含むボーン木の剛体質量・ジョイントスプリングを補完設定します";
 
+		// これがないとLimitedPluginLauncherがこのプラグインの名前を取得できない
 		public IPEPluginOption Option { get; } =
-			new PEPluginOption(false, true, "物理チェーン自動調整");
+			new PEPluginOption(false, true, PluginName);
 
 		public void Run(IPERunArgs args)
 		{
@@ -25,7 +23,6 @@ namespace PhysicsChainAdjuster
 				var pmx = args.Host.Connector.Pmx.GetCurrentState();
 				int[] selected = ResolveSelectedBoneIndices(args, pmx);
 
-				// PMX Editor起動時のプラグイン検証呼び出しでは未選択のため、静かに終了する
 				if (selected.Length == 0)
 				{
 					return;
@@ -33,37 +30,34 @@ namespace PhysicsChainAdjuster
 
 				if (selected.Length == 1)
 				{
-					MessageBox.Show("2本以上のボーン、または関連ボーンを持つ剛体を選択してください。", "エラー",
+					MessageBox.Show("2つ以上の関連剛体を持つボーンか、ジョイントで接続された剛体群を選択してください。", "エラー",
 						MessageBoxButtons.OK, MessageBoxIcon.Warning);
 					return;
 				}
 
-				if (!ValidateSelectionIsIndependentChains(pmx, selected, out var validationError))
+				if (!ValidateSelection(pmx, selected, out var validationError))
 				{
 					MessageBox.Show(
-						$"{validationError}\n\nそれぞれに独立し、分岐のないボーン列を選択してください。",
+						validationError,
 						"エラー",
 						MessageBoxButtons.OK,
 						MessageBoxIcon.Warning);
 					return;
 				}
 
-				// ---- ボーンチェーンの構築 ----
-				var chains = BuildBoneChains(pmx, selected);
-
-				if (chains.Count == 0)
+				var components = BuildBoneComponents(pmx, selected);
+				if (components.Count == 0)
 				{
-					MessageBox.Show("選択対象（ボーン/剛体）から有効なボーンチェーンを構築できませんでした。", "エラー",
+					MessageBox.Show("選択対象（ボーン/剛体）から有効なボーン木を構築できませんでした。", "エラー",
 						MessageBoxButtons.OK, MessageBoxIcon.Warning);
 					return;
 				}
 
-				// ---- ダイアログ表示 ----
-				using (var dlg = new SettingDialog(chains))
+				using (var dlg = new SettingDialog(components))
 				{
 					if (dlg.ShowDialog() != DialogResult.OK) return;
 
-					ApplyParameters(pmx, chains, dlg.Settings);
+					ApplyParameters(pmx, components, dlg.Settings);
 				}
 
 				args.Host.Connector.Pmx.Update(pmx);
@@ -78,7 +72,6 @@ namespace PhysicsChainAdjuster
 			}
 		}
 
-		// 選択ボーンを優先し、未選択時は選択剛体から関連ボーンを解決する
 		private int[] ResolveSelectedBoneIndices(IPERunArgs args, IPXPmx pmx)
 		{
 			int[] selectedBoneIndices = args.Host.Connector.View.PMDView.GetSelectedBoneIndices()
@@ -100,59 +93,110 @@ namespace PhysicsChainAdjuster
 				.ToArray();
 		}
 
-		// ============================================================
-		//  ボーンチェーン構築
-		//  選択ボーンを「親→子」でつながるチェーンに分割する
-		//  ※ 参照ベースで管理する
-		// ============================================================
-		private List<List<IPXBone>> BuildBoneChains(IPXPmx pmx, int[] selectedIndices)
+		private List<BoneComponent> BuildBoneComponents(IPXPmx pmx, int[] selectedIndices)
 		{
 			var selectedSet = new HashSet<IPXBone>(selectedIndices.Select(i => pmx.Bone[i]));
-			var chains = new List<List<IPXBone>>();
+			var childMap = pmx.Bone
+				.Where(selectedSet.Contains)
+				.GroupBy(b => b.Parent)
+				.ToDictionary(g => g.Key, g => g.ToList());
 
-			// 選択ボーンのうち「親が選択に含まれない」ものを各チェーンの先頭とみなす
+			var components = new List<BoneComponent>();
+			var visited = new HashSet<IPXBone>();
 			var roots = selectedSet
 				.Where(b => b.Parent == null || !selectedSet.Contains(b.Parent))
+				.OrderBy(b => pmx.Bone.IndexOf(b))
 				.ToList();
 
 			foreach (var root in roots)
 			{
-				var chain = new List<IPXBone>();
-				var visited = new HashSet<IPXBone>();
-				IPXBone? cur = root;
-				while (cur != null && selectedSet.Contains(cur) && visited.Add(cur))
+				if (visited.Contains(root))
 				{
-					chain.Add(cur);
-					// 子ボーンの中から選択済みのものを探す
-					cur = pmx.Bone.FirstOrDefault(b => b.Parent == cur && selectedSet.Contains(b));
+					continue;
 				}
-				if (chain.Count >= 2) chains.Add(chain);
+
+				var boneDepths = new Dictionary<IPXBone, int>();
+				var stack = new Stack<(IPXBone Bone, int Depth)>();
+				stack.Push((root, 0));
+
+				while (stack.Count > 0)
+				{
+					var (bone, depth) = stack.Pop();
+					if (!visited.Add(bone))
+					{
+						continue;
+					}
+
+					boneDepths[bone] = depth;
+					if (!childMap.TryGetValue(bone, out var children))
+					{
+						continue;
+					}
+
+					for (int i = children.Count - 1; i >= 0; i--)
+					{
+						stack.Push((children[i], depth + 1));
+					}
+				}
+
+				if (boneDepths.Count > 0)
+				{
+					components.Add(new BoneComponent(root, boneDepths));
+				}
 			}
 
-			return chains;
+			return components;
 		}
 
-		// 選択ボーンが「独立した線形チェーンの集合」かどうかを検証する
-		private bool ValidateSelectionIsIndependentChains(IPXPmx pmx, int[] selectedIndices, out string error)
+		private bool ValidateSelection(IPXPmx pmx, int[] selectedIndices, out string error)
 		{
 			error = string.Empty;
 			var selectedSet = new HashSet<IPXBone>(selectedIndices.Select(i => pmx.Bone[i]));
 
-			foreach (var bone in selectedSet)
+			if (!ValidateBoneHierarchy(selectedSet, out error))
 			{
-				int selectedChildCount = pmx.Bone.Count(b => b.Parent == bone && selectedSet.Contains(b));
-				if (selectedChildCount > 1)
-				{
-					error = "選択ボーン内に分岐が含まれています。";
-					return false;
-				}
+				return false;
 			}
 
-			// 親参照を辿って、選択集合内に循環がないことを確認する
+			var rigidMap = BuildRigidBodyMap(pmx);
+			var selectedBodies = selectedSet
+				.Where(rigidMap.ContainsKey)
+				.SelectMany(b => rigidMap[b])
+				.ToHashSet();
+
+			if (selectedBodies.Any(body => body.Mode == BodyMode.DynamicWithBone))
+			{
+				error = "キネマティック剛体（ボーン追従剛体）が含まれています。対象から外してください。";
+				return false;
+			}
+
+			if (HasJointCycle(pmx, selectedBodies))
+			{
+				error = "ジョイントの接続に循環が含まれています。循環しない木構造になるよう選択し直してください。";
+				return false;
+			}
+
+			return true;
+		}
+
+		private bool ValidateBoneHierarchy(HashSet<IPXBone> selectedSet, out string error)
+		{
+			error = string.Empty;
+
+			bool hasRoot = selectedSet.Any(b => b.Parent == null || !selectedSet.Contains(b.Parent));
+			if (!hasRoot)
+			{
+				error = "選択ボーン列の先頭を判定できませんでした。";
+				return false;
+			}
+
 			var checkedNodes = new HashSet<IPXBone>();
 			foreach (var start in selectedSet)
 			{
-				if (checkedNodes.Contains(start)) continue;
+				if (checkedNodes.Contains(start))
+				{
+					continue;
+				}
 
 				var path = new HashSet<IPXBone>();
 				IPXBone? cur = start;
@@ -169,59 +213,131 @@ namespace PhysicsChainAdjuster
 				}
 			}
 
-			// 2本以上選択されているため、少なくとも1本は選択内の親を持たない先頭が必要
-			bool hasRoot = selectedSet.Any(b => b.Parent == null || !selectedSet.Contains(b.Parent));
-			if (!hasRoot)
-			{
-				error = "選択ボーン列の先頭を判定できませんでした。";
-				return false;
-			}
-
 			return true;
 		}
 
-		// ============================================================
-		//  パラメータ適用
-		// ============================================================
-		private void ApplyParameters(IPXPmx pmx, List<List<IPXBone>> chains, PhysicsSettings s)
+		private bool HasJointCycle(IPXPmx pmx, HashSet<IPXBody> selectedBodies)
 		{
-			// ボーン参照 -> 紐づく剛体リストのマップ
-			var rigidMap = BuildRigidBodyMap(pmx);
+			var adjacency = new Dictionary<IPXBody, List<(IPXBody Other, IPXJoint Joint)>>();
 
-			foreach (var chain in chains)
+			foreach (var joint in pmx.Joint)
 			{
-				int n = chain.Count; // ボーン数
-
-				var jointSeq = BuildJointSequence(pmx, chain, rigidMap);
-
-				// --- 剛体質量の設定 ---
-				for (int k = 0; k < n; k++)
+				if (joint.BodyA == null || joint.BodyB == null)
 				{
-					double t = (n == 1) ? 0.0 : (double)k / (n - 1);
-					float mass = (float)Interpolate(s.MassStart, s.MassEnd, t, s.UseLogInterp);
+					continue;
+				}
 
-					if (rigidMap.TryGetValue(chain[k], out var bodies))
+				if (!selectedBodies.Contains(joint.BodyA) || !selectedBodies.Contains(joint.BodyB))
+				{
+					continue;
+				}
+
+				if (!adjacency.TryGetValue(joint.BodyA, out var aList))
+				{
+					aList = new List<(IPXBody Other, IPXJoint Joint)>();
+					adjacency[joint.BodyA] = aList;
+				}
+				aList.Add((joint.BodyB, joint));
+
+				if (!adjacency.TryGetValue(joint.BodyB, out var bList))
+				{
+					bList = new List<(IPXBody Other, IPXJoint Joint)>();
+					adjacency[joint.BodyB] = bList;
+				}
+				bList.Add((joint.BodyA, joint));
+			}
+
+			var visitedBodies = new HashSet<IPXBody>();
+			var visitedJoints = new HashSet<IPXJoint>();
+
+			foreach (var start in adjacency.Keys)
+			{
+				if (!visitedBodies.Add(start))
+				{
+					continue;
+				}
+
+				var stack = new Stack<(IPXBody Body, IPXBody? Parent)>();
+				stack.Push((start, null));
+
+				while (stack.Count > 0)
+				{
+					var (body, parent) = stack.Pop();
+					foreach (var edge in adjacency[body])
 					{
-						foreach (var body in bodies)
-							body.Mass = mass;
+						if (!visitedJoints.Add(edge.Joint))
+						{
+							continue;
+						}
+
+						if (parent != null && ReferenceEquals(edge.Other, parent))
+						{
+							continue;
+						}
+
+						if (!visitedBodies.Add(edge.Other))
+						{
+							return true;
+						}
+
+						stack.Push((edge.Other, body));
 					}
 				}
+			}
 
-				// --- ジョイントスプリングの設定 ---
-				// ジョイント数 = ボーン数 - 1 (各ボーン間に1つ)
-				for (int k = 0; k < jointSeq.Count; k++)
-				{
-					int jTotal = jointSeq.Count;
-					double t = (jTotal == 1) ? 0.0 : (double)k / (jTotal - 1);
-					float spring = (float)Interpolate(s.SpringStart, s.SpringEnd, t, s.UseLogInterp);
+			return false;
+		}
 
-					// 回転スプリングのX・Y・Zすべてに適用
-					jointSeq[k].SpringConst_Rotate = new V3(spring, spring, spring);
-				}
+		private void ApplyParameters(IPXPmx pmx, List<BoneComponent> components, PhysicsSettings s)
+		{
+			var rigidMap = BuildRigidBodyMap(pmx);
+
+			foreach (var component in components)
+			{
+				ApplyMasses(component, rigidMap, s);
+				ApplyJointSprings(pmx, component, rigidMap, s);
 			}
 		}
 
-		// ボーン参照 -> 紐づく剛体参照リストのマップ
+		private void ApplyMasses(BoneComponent component, Dictionary<IPXBone, List<IPXBody>> rigidMap, PhysicsSettings s)
+		{
+			var bodiesWithDepth = component.BoneDepths
+				.Where(pair => rigidMap.ContainsKey(pair.Key))
+				.SelectMany(pair => rigidMap[pair.Key].Select(body => (Body: body, Depth: pair.Value)))
+				.ToList();
+
+			if (bodiesWithDepth.Count == 0)
+			{
+				return;
+			}
+
+			int maxDepth = bodiesWithDepth.Max(x => x.Depth);
+			foreach (var item in bodiesWithDepth)
+			{
+				double t = maxDepth == 0 ? 0.0 : (double)item.Depth / maxDepth;
+				float mass = (float)Interpolate(s.MassStart, s.MassEnd, t, s.UseLogInterp);
+				item.Body.Mass = mass;
+			}
+		}
+
+		private void ApplyJointSprings(IPXPmx pmx, BoneComponent component,
+			Dictionary<IPXBone, List<IPXBody>> rigidMap, PhysicsSettings s)
+		{
+			var jointDepths = BuildJointDepthMap(pmx, component, rigidMap);
+			if (jointDepths.Count == 0)
+			{
+				return;
+			}
+
+			int maxDepth = jointDepths.Values.Max();
+			foreach (var pair in jointDepths)
+			{
+				double t = maxDepth == 0 ? 0.0 : (double)pair.Value / maxDepth;
+				float spring = (float)Interpolate(s.SpringStart, s.SpringEnd, t, s.UseLogInterp);
+				pair.Key.SpringConst_Rotate = new V3(spring, spring, spring);
+			}
+		}
+
 		private Dictionary<IPXBone, List<IPXBody>> BuildRigidBodyMap(IPXPmx pmx)
 		{
 			var map = new Dictionary<IPXBone, List<IPXBody>>();
@@ -234,52 +350,77 @@ namespace PhysicsChainAdjuster
 			return map;
 		}
 
-		// チェーン上のジョイントを順序付きで返す
-		// 先頭ボーンの親が存在する場合は「親→先頭」も含め、以降はチェーン内の隣接ペアを抽出
-		private List<IPXJoint> BuildJointSequence(IPXPmx pmx, List<IPXBone> chain,
+		private Dictionary<IPXJoint, int> BuildJointDepthMap(IPXPmx pmx, BoneComponent component,
 			Dictionary<IPXBone, List<IPXBody>> rigidMap)
 		{
-			var result = new List<IPXJoint>();
+			var result = new Dictionary<IPXJoint, int>();
+			var componentBones = component.Bones.ToHashSet();
 
-			IPXJoint? FindJointBetween(IPXBone a, IPXBone b)
+			foreach (var bone in component.Bones)
 			{
-				if (!rigidMap.TryGetValue(a, out var bodiesA)) return null;
-				if (!rigidMap.TryGetValue(b, out var bodiesB)) return null;
+				int depth = component.BoneDepths[bone];
+				var parent = bone.Parent;
+				if (parent == null)
+				{
+					continue;
+				}
 
-				var setA = new HashSet<IPXBody>(bodiesA);
-				var setB = new HashSet<IPXBody>(bodiesB);
+				bool isInternalEdge = componentBones.Contains(parent);
+				bool isRootParentEdge = ReferenceEquals(bone, component.Root);
+				if (!isInternalEdge && !isRootParentEdge)
+				{
+					continue;
+				}
 
-				return pmx.Joint.FirstOrDefault(j =>
-					(setA.Contains(j.BodyA) && setB.Contains(j.BodyB)) ||
-					(setB.Contains(j.BodyA) && setA.Contains(j.BodyB)));
+				foreach (var joint in FindJointsBetween(pmx, parent, bone, rigidMap))
+				{
+					if (!result.ContainsKey(joint))
+					{
+						result[joint] = depth;
+					}
+				}
 			}
 
-			// 選択チェーンの先頭だけは、選択外の親とのジョイントも補完対象に含める
-			var rootParent = chain[0].Parent;
-			if (rootParent != null)
-			{
-				var parentJoint = FindJointBetween(rootParent, chain[0]);
-				if (parentJoint != null)
-					result.Add(parentJoint);
-			}
-
-			for (int seg = 0; seg < chain.Count - 1; seg++)
-			{
-				var joint = FindJointBetween(chain[seg], chain[seg + 1]);
-				if (joint != null)
-					result.Add(joint);
-				// 1セグメントにつき最初に見つかった1つを使用
-			}
 			return result;
 		}
 
-		// 線形 / 対数補完
+		private IEnumerable<IPXJoint> FindJointsBetween(IPXPmx pmx, IPXBone a, IPXBone b,
+			Dictionary<IPXBone, List<IPXBody>> rigidMap)
+		{
+			if (!rigidMap.TryGetValue(a, out var bodiesA))
+			{
+				yield break;
+			}
+
+			if (!rigidMap.TryGetValue(b, out var bodiesB))
+			{
+				yield break;
+			}
+
+			var setA = new HashSet<IPXBody>(bodiesA);
+			var setB = new HashSet<IPXBody>(bodiesB);
+
+			foreach (var joint in pmx.Joint)
+			{
+				if (joint.BodyA == null || joint.BodyB == null)
+				{
+					continue;
+				}
+
+				bool ab = setA.Contains(joint.BodyA) && setB.Contains(joint.BodyB);
+				bool ba = setB.Contains(joint.BodyA) && setA.Contains(joint.BodyB);
+				if (ab || ba)
+				{
+					yield return joint;
+				}
+			}
+		}
+
 		private double Interpolate(double start, double end, double t, bool useLog)
 		{
 			if (!useLog)
 				return start + (end - start) * t;
 
-			// 対数補完: log空間で線形補完 (0値対策でepsilonを足す)
 			const double eps = 1e-6;
 			double logStart = Math.Log(Math.Max(start, eps));
 			double logEnd = Math.Log(Math.Max(end, eps));
@@ -288,13 +429,29 @@ namespace PhysicsChainAdjuster
 
 		public void Dispose()
 		{
-			// リソース解放が不要な場合は空実装
 		}
 	}
 
-	// ============================================================
-	//  設定値を保持するシンプルなDTO
-	// ============================================================
+	public sealed class BoneComponent
+	{
+		public BoneComponent(IPXBone root, Dictionary<IPXBone, int> boneDepths)
+		{
+			Root = root;
+			BoneDepths = boneDepths;
+			Bones = boneDepths
+				.OrderBy(pair => pair.Value)
+				.ThenBy(pair => pair.Key.Name)
+				.Select(pair => pair.Key)
+				.ToList();
+			MaxDepth = boneDepths.Count == 0 ? 0 : boneDepths.Values.Max();
+		}
+
+		public IPXBone Root { get; }
+		public Dictionary<IPXBone, int> BoneDepths { get; }
+		public List<IPXBone> Bones { get; }
+		public int MaxDepth { get; }
+	}
+
 	public class PhysicsSettings
 	{
 		public float MassStart { get; set; } = 1.0f;
@@ -304,9 +461,6 @@ namespace PhysicsChainAdjuster
 		public bool UseLogInterp { get; set; } = true;
 	}
 
-	// ============================================================
-	//  設定ダイアログ
-	// ============================================================
 	public class SettingDialog : Form
 	{
 		public PhysicsSettings Settings { get; private set; } = new PhysicsSettings();
@@ -315,7 +469,7 @@ namespace PhysicsChainAdjuster
 		private RadioButton _rbLinear, _rbLog;
 		private Label _chainInfoLabel;
 
-		public SettingDialog(List<List<IPXBone>> chains)
+		public SettingDialog(List<BoneComponent> components)
 		{
 			Text = "物理チェーン自動調整";
 			FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -327,11 +481,10 @@ namespace PhysicsChainAdjuster
 
 			int y = 12;
 
-			// チェーン情報
 			_chainInfoLabel = new Label
 			{
-				Text = $"検出チェーン数: {chains.Count}本  " +
-						 $"(各チェーン長: {string.Join(", ", chains.Select(c => c.Count))} ボーン)",
+				Text = $"検出グループ数: {components.Count}件  " +
+						 $"(各最大段数: {string.Join(", ", components.Select(c => c.MaxDepth + 1))})",
 				Left = 12,
 				Top = y,
 				Width = 330,
@@ -340,27 +493,23 @@ namespace PhysicsChainAdjuster
 			Controls.Add(_chainInfoLabel);
 			y += 28;
 
-			// ---- 剛体質量 ----
-			AddSectionLabel("剛体質量", y); y += 22;
-			_massStart = AddRow("始点ボーン質量", 1.0f, ref y);
-			_massEnd = AddRow("終端ボーン質量", 0.1f, ref y);
+			AddSectionLabel("剛体", y); y += 22;
+			_massStart = AddRow("始点質量", 1.0f, ref y);
+			_massEnd = AddRow("終端質量", 0.1f, ref y);
 			y += 4;
 
-			// ---- ジョイントスプリング ----
-			AddSectionLabel("ジョイントスプリング（回転）", y); y += 22;
-			_springStart = AddRow("始点スプリング", 100f, ref y);
-			_springEnd = AddRow("終点スプリング", 10f, ref y);
+			AddSectionLabel("スプリング（回転）", y); y += 22;
+			_springStart = AddRow("始点", 100f, ref y);
+			_springEnd = AddRow("終点", 10f, ref y);
 			y += 4;
 
-			// ---- 補完方式 ----
 			AddSectionLabel("補完方式", y); y += 22;
-			_rbLinear = new RadioButton { Text = "線形補完", Left = 20, Top = y, Width = 110 };
-			_rbLog = new RadioButton { Text = "対数補完", Left = 140, Top = y, Width = 110, Checked = true };
+			_rbLinear = new RadioButton { Text = "線形", Left = 20, Top = y, Width = 110 };
+			_rbLog = new RadioButton { Text = "対数", Left = 140, Top = y, Width = 110, Checked = true };
 			Controls.Add(_rbLinear);
 			Controls.Add(_rbLog);
 			y += 30;
 
-			// ---- ボタン ----
 			var btnOk = new Button
 			{
 				Text = "適用",
