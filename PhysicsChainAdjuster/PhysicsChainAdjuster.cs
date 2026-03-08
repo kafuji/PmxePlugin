@@ -2,6 +2,8 @@
 using PEPlugin.Pmd;
 using PEPlugin.Pmx;
 using PEPlugin.SDX;
+using System.IO;
+using System.Xml.Serialization;
 
 namespace PhysicsChainAdjuster
 {
@@ -78,8 +80,6 @@ namespace PhysicsChainAdjuster
 
 				args.Host.Connector.Pmx.Update(pmx);
 				args.Host.Connector.Form.UpdateList(UpdateObject.All);
-				MessageBox.Show("物理パラメータの設定が完了しました。", "完了",
-					MessageBoxButtons.OK, MessageBoxIcon.Information);
 			}
 			catch (Exception ex)
 			{
@@ -487,6 +487,8 @@ namespace PhysicsChainAdjuster
 
 		public SettingDialog(List<BoneComponent> components)
 		{
+			var initialSettings = PhysicsSettingsStore.Load();
+
 			Text = "物理チェーン自動調整";
 			FormBorderStyle = FormBorderStyle.FixedDialog;
 			StartPosition = FormStartPosition.CenterParent;
@@ -566,11 +568,14 @@ namespace PhysicsChainAdjuster
 				}
 
 				Settings = settings;
+				PhysicsSettingsStore.Save(Settings);
 			};
 			Controls.Add(btnOk);
 			Controls.Add(btnCancel);
 			AcceptButton = btnOk;
 			CancelButton = btnCancel;
+
+			ApplySettingsToControls(initialSettings);
 		}
 
 		private void AddSectionLabel(string text, int y)
@@ -615,6 +620,19 @@ namespace PhysicsChainAdjuster
 			_springAxisScaleZ = new TextBox { Left = 260, Top = y, Width = 34, Height = 23, Text = "1.0" };
 			Controls.Add(_springAxisScaleZ);
 			y += 24;
+		}
+
+		private void ApplySettingsToControls(PhysicsSettings settings)
+		{
+			_massStart.Text = settings.MassStart.ToString();
+			_massEnd.Text = settings.MassEnd.ToString();
+			_springStart.Text = settings.SpringStart.ToString();
+			_springEnd.Text = settings.SpringEnd.ToString();
+			_springAxisScaleX.Text = settings.SpringAxisScaleX.ToString();
+			_springAxisScaleY.Text = settings.SpringAxisScaleY.ToString();
+			_springAxisScaleZ.Text = settings.SpringAxisScaleZ.ToString();
+			_rbLog.Checked = settings.UseLogInterp;
+			_rbLinear.Checked = !settings.UseLogInterp;
 		}
 
 		private bool TryReadSettings(out PhysicsSettings settings, out string errorMessage)
@@ -686,6 +704,43 @@ namespace PhysicsChainAdjuster
 			}
 
 			return value >= 0f;
+		}
+	}
+
+	public static class PhysicsSettingsStore
+	{
+		private static readonly XmlSerializer Serializer = new(typeof(PhysicsSettings));
+		private static readonly string SettingsPath =
+			Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "PhysicsChainAdjuster.settings.xml");
+
+		public static PhysicsSettings Load()
+		{
+			try
+			{
+				if (!File.Exists(SettingsPath))
+				{
+					return new PhysicsSettings();
+				}
+
+				using var stream = File.OpenRead(SettingsPath);
+				return Serializer.Deserialize(stream) as PhysicsSettings ?? new PhysicsSettings();
+			}
+			catch
+			{
+				return new PhysicsSettings();
+			}
+		}
+
+		public static void Save(PhysicsSettings settings)
+		{
+			try
+			{
+				using var stream = File.Create(SettingsPath);
+				Serializer.Serialize(stream, settings);
+			}
+			catch
+			{
+			}
 		}
 	}
 }
