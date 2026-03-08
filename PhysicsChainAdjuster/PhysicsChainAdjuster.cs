@@ -11,7 +11,7 @@ namespace PhysicsChainAdjuster
 	{
 		private const string PluginName = "[Kafuji式] 物理チェーン自動調整";
 		public string Name => PluginName;
-		public string Version => "1.1.0";
+		public string Version => "1.2.0";
 		public string Description => "分岐を含むダイナミック剛体列（復数可）の質量・ジョイントスプリングを一括で補完設定します";
 
 		// これがないとLimitedPluginLauncherがこのプラグインの名前を取得できない
